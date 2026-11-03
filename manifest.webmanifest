@@ -2,7 +2,7 @@
   "name": "사진 색칠하기",
   "short_name": "색칠하기",
   "lang": "ko",
-  "id": "/photo-coloring/",
+  "id": "/photo-coloring/app2",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",
