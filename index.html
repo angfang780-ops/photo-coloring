@@ -126,8 +126,10 @@
             <button class="btn" type="button" data-v="photo" aria-pressed="true">사진</button>
           </div>
           <input id="file" class="vh" type="file" accept="image/*">
-          <label for="file" class="btn primary wide">사진 고르기</label>
-          <button id="next" class="btn wide" type="button">다른 사진으로</button>
+          <label for="file" class="btn primary wide" id="fileLbl">사진 한 장 고르기</label>
+          <input id="dir" class="vh" type="file" webkitdirectory multiple>
+          <label for="dir" class="btn wide" id="dirLbl">폴더 고르기</label>
+          <button id="next" class="btn wide" type="button" hidden>다른 사진으로</button>
           <div id="level" class="seg wide" role="group" aria-label="칸 수">
             <button class="btn" type="button" data-v="1" aria-pressed="true">칸 적게</button>
             <button class="btn" type="button" data-v="2" aria-pressed="false">보통</button>
@@ -138,7 +140,7 @@
           <button id="sound" class="btn" type="button" aria-pressed="true">소리</button>
           <button id="full" class="btn" type="button">전체 화면</button>
         </div>
-        <p class="note">물감을 고르고 칸을 누르면 칠해져요. 무지개 동그라미는 원래 색으로 칠해요. 「그림책」은 틀린 그림 찾기에 넣어 둔 그림을 선만 남기고 하얗게 비워서 칠해요. 「사진」은 사진 퍼즐·숨은그림 등에 넣어 둔 사진을 써요.</p>
+        <p class="note">물감을 고르고 칸을 누르면 칠해져요. 무지개 동그라미는 원래 색으로 칠해요. 「그림책」은 고른 그림을 선만 남기고 하얗게 비워서 칠해요(색이 다른 곳마다 칸이 나뉘어요). 폴더는 그림책·사진 따로 기억해요.</p>
         <button id="menuClose" class="btn primary" type="button">닫고 칠하기</button>
       </div>
     </div>
@@ -309,17 +311,26 @@
     const wide = box(box(dark, w, h, R, true), w, h, R, false);
     const ink = new Uint8Array(N); for (let i = 0; i < N; i++) if (dark[i] && !wide[i]) ink[i] = 1;
     // 2) 선을 한 점 두껍게 해서(끊긴 틈 막기) 나머지를 이어진 곳마다 칸으로
+    //    검은 선이 없어도 색이 다르면 다른 칸 — 칸의 평균 색과 많이 다른 점은 넘어가지 않는다
     const thick = box(ink, w, h, 1, false);
+    g.filter = 'blur(1px)'; g.drawImage(img, 0, 0); g.filter = 'none';
+    const sm = g.getImageData(0, 0, w, h).data; // 색 비교용 (JPEG 얼룩을 조금 눌러 둔 것)
+    const TOL = 38*38;
     const comp = new Int32Array(N).fill(-1), stack = new Int32Array(N), sizes = [];
     let nc = 0;
     for (let i = 0; i < N; i++){
       if (thick[i] || comp[i] >= 0) continue;
-      let sp = 0, n = 0; stack[sp++] = i; comp[i] = nc;
+      let sp = 0, n = 1, sr = sm[i*4], sg = sm[i*4+1], sb = sm[i*4+2];
+      stack[sp++] = i; comp[i] = nc;
       while (sp){
-        const q = stack[--sp], x = q % w; n++;
+        const q = stack[--sp], x = q % w;
         // 넓은 어두운 곳과 밝은 곳은 맞닿아 있어도 다른 칸
-        for (const j of [x > 0 ? q-1 : -1, x < w-1 ? q+1 : -1, q >= w ? q-w : -1, q < N-w ? q+w : -1])
-          if (j >= 0 && !thick[j] && comp[j] < 0 && wide[j] === wide[q]){ comp[j] = nc; stack[sp++] = j; }
+        for (const j of [x > 0 ? q-1 : -1, x < w-1 ? q+1 : -1, q >= w ? q-w : -1, q < N-w ? q+w : -1]){
+          if (j < 0 || thick[j] || comp[j] >= 0 || wide[j] !== wide[q]) continue;
+          const p = j*4;
+          if ((sm[p] - sr/n)**2 + (sm[p+1] - sg/n)**2 + (sm[p+2] - sb/n)**2 > TOL) continue;
+          comp[j] = nc; stack[sp++] = j; n++; sr += sm[p]; sg += sm[p+1]; sb += sm[p+2];
+        }
       }
       sizes.push(n); nc++;
     }
@@ -450,7 +461,7 @@
     let a = 0; for (const k of P.fills.keys()) a += P.start[k+1] - P.start[k];
     $('#pct').textContent = Math.round(a/(P.area || P.w*P.h)*100) + '%';
     $('#level').hidden = !!P.book;
-    $('#next').textContent = prefs.mode === 'book' ? '다른 그림으로' : '다른 사진으로';
+    syncAlbum();
     $('#peek').textContent = P.book ? '원래 그림' : '원래 사진';
     $('#undo').disabled = !P.undo.length;
     const pv = $('#pv'); pv.width = 480; pv.height = Math.round(480*P.h/P.w);
@@ -528,46 +539,110 @@
     return c;
   }
 
-  // ---------- 다른 게임에 넣어 둔 사진 빌려 쓰기 ----------
-  // 같은 주소(github.io)의 사진 퍼즐·숨은그림·틀린그림·짝 맞추기가 기기에 저장한 사진
-  const SHARED = ['jigsaw', 'hidden', 'diff', 'pairs'];
-  async function otherDb(name){
-    if (!indexedDB.databases) return null;
-    const list = await indexedDB.databases();
-    if (!list.some(d => d.name === name)) return null; // 없는 이름을 열면 빈 저장소가 생겨 그 앱이 망가진다
-    return new Promise(ok => {
+  // ---------- 이 앱의 폴더 (다른 게임 사진은 쓰지 않는다) ----------
+  // 「그림책」 폴더와 「사진」 폴더를 따로 기억한다 — 기기 저장소 'color'의 book·photo 칸
+  const ALBUM = 'color.album';
+  const albums = { book: { keys: [], bag: [], cur: null }, photo: { keys: [], bag: [], cur: null } };
+  const mem = { book: [], photo: [] }; // 저장소를 못 열 때만: 고른 파일 그대로 (앱을 닫으면 잊음)
+  let dbp = null, importJob = 0;
+  function db(){
+    if (!dbp) dbp = new Promise((ok, no) => {
       try {
-        const rq = indexedDB.open(name);
-        rq.onsuccess = () => { const d = rq.result; if (d.objectStoreNames.contains('photos')) ok(d); else { d.close(); ok(null); } };
-        rq.onerror = () => ok(null);
-      } catch(e){ ok(null); }
+        const rq = indexedDB.open('color', 1);
+        rq.onupgradeneeded = () => { for (const s of ['book', 'photo']) if (!rq.result.objectStoreNames.contains(s)) rq.result.createObjectStore(s); };
+        rq.onsuccess = () => ok(rq.result);
+        rq.onerror = () => no(rq.error);
+      } catch(e){ no(e); }
     });
+    return dbp;
   }
-  const req = (d, fn) => new Promise((ok, no) => { const tx = d.transaction('photos', 'readonly'), r = fn(tx.objectStore('photos')); tx.oncomplete = () => ok(r.result); tx.onerror = () => no(tx.error); });
-  // 그림책이면 틀린 그림 찾기에 넣은 그림 중 두 그림이 나란한 캡처만
-  async function borrowedPhoto(book){
-    const all = [];
-    for (const name of book ? ['diff'] : SHARED){
-      try { const d = await otherDb(name); if (!d) continue; const ks = await req(d, st => st.getAllKeys()); ks.forEach(k => all.push([d, k, name])); } catch(e){}
-    }
-    // 사진이면 거꾸로, 틀린 그림 찾기의 나란한 캡처(가로가 세로의 2배 넘음)는 뺀다
-    const ok = (im, name) => book ? im.width/im.height >= 1.6 : !(name === 'diff' && im.width/im.height >= 2);
-    for (let tries = 0; all.length && tries < 12; tries++){
-      const at = Math.floor(Math.random()*all.length), [d, k, name] = all[at];
-      const blob = await req(d, st => st.get(k));
-      const url = URL.createObjectURL(blob);
-      let im; try { im = await loadImg(url); } finally { URL.revokeObjectURL(url); }
-      if (ok(im, name)) return im;
-      all.splice(at, 1);
-    }
-    return null;
+  function idb(name, mode, fn){
+    return db().then(d => new Promise((ok, no) => {
+      const tx = d.transaction(name, mode), r = fn(tx.objectStore(name));
+      tx.oncomplete = () => ok(r && r.result);
+      tx.onerror = tx.onabort = () => no(tx.error);
+    }));
   }
+  const toJpeg = c => new Promise((ok, no) => c.toBlob(b => b ? ok(b) : no(new Error('blob')), 'image/jpeg', .9));
+  const shuffle = a => { for (let i = a.length-1; i > 0; i--){ const j = Math.floor(Math.random()*(i+1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+  function saveAlbum(){ store.set(ALBUM, JSON.stringify(albums)); }
+  function loadAlbum(){
+    try {
+      const a = JSON.parse(store.get(ALBUM) || 'null');
+      for (const m of ['book', 'photo']) if (a && a[m] && Array.isArray(a[m].keys)){ albums[m].keys = a[m].keys; albums[m].bag = (a[m].bag || []).filter(k => a[m].keys.includes(k)); albums[m].cur = a[m].cur; }
+    } catch(e){}
+  }
+  const albumSize = m => albums[m].keys.length || mem[m].length;
+  function syncAlbum(){
+    const n = albumSize(prefs.mode), word = prefs.mode === 'book' ? '그림' : '사진';
+    $('#next').hidden = !n;
+    $('#next').textContent = `다른 ${word}으로 (${n}장 중에서)`;
+    $('#fileLbl').textContent = `${word} 한 장 고르기`;
+  }
+  async function useAlbum(list){
+    const m = prefs.mode;
+    let files = [...list].filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(f.name));
+    if (!files.length){ toast('사진 파일이 없어요. 그림이 들어 있는 폴더를 골라 주세요.'); return; }
+    shuffle(files);
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e){}
+    const job = ++importJob;
+    // 첫 장으로 바로 시작
+    let first = -1;
+    for (let i = 0; i < files.length && first < 0; i++){
+      const url = URL.createObjectURL(files[i]);
+      try { const im = await loadImg(url); first = i; if (job === importJob) await newPicture(im, prefs.level); } catch(e){} finally { URL.revokeObjectURL(url); }
+    }
+    if (job !== importJob) return;
+    if (first < 0){ toast('이 파일들은 열 수 없어요. 사진(JPG·PNG) 파일을 골라 주세요.'); return; }
+    files = files.slice(first);
+    // 줄여서 기기에 저장 — 앱을 닫아도 폴더가 남게
+    const A = albums[m];
+    try { await idb(m, 'readwrite', st => st.clear()); }
+    catch(e){
+      mem[m] = files; A.keys = []; A.bag = []; A.cur = null; saveAlbum(); syncAlbum();
+      toast(`${files.length}장을 골랐어요. (앱을 닫으면 폴더는 잊어요)`);
+      return;
+    }
+    if (job !== importJob) return;
+    A.keys = []; A.bag = []; A.cur = 0; mem[m] = [];
+    let key = 0;
+    for (const f of files){
+      const url = URL.createObjectURL(f);
+      try {
+        const blob = await toJpeg(fit(await loadImg(url), 2000));
+        if (job !== importJob) return;
+        const k = key++;
+        await idb(m, 'readwrite', st => st.put(blob, k));
+        if (job !== importJob) return;
+        A.keys.push(k); if (k !== A.cur) A.bag.push(k);
+      } catch(e){ if (job !== importJob) return; } finally { URL.revokeObjectURL(url); }
+      if (A.keys.length % 10 === 0){ saveAlbum(); syncAlbum(); if (files.length > 10) toast(`폴더 정리 중… ${A.keys.length}/${files.length}`); }
+    }
+    saveAlbum(); syncAlbum();
+    toast(`${A.keys.length}장을 넣었어요. 「다른 ${m === 'book' ? '그림' : '사진'}으로」를 누르면 이 중에서 골라요.`);
+  }
+  // 지금 방식(그림책/사진) 폴더에서 아직 안 본 것 하나
   async function nextPhoto(quiet){
-    const book = prefs.mode === 'book';
-    const im = await borrowedPhoto(book).catch(() => null);
-    if (!im){ if (quiet !== true) toast(book ? '틀린 그림 찾기에 넣어 둔 그림이 없어요. 「사진 고르기」로 그림을 골라 주세요.' : '다른 게임에 넣어 둔 사진이 없어요. 「사진 고르기」로 골라 주세요.'); return false; }
-    await newPicture(im, prefs.level);
-    return true;
+    const m = prefs.mode, A = albums[m];
+    for (let tries = 0; tries < 6; tries++){
+      let src = null, k = null;
+      if (A.keys.length){
+        if (!A.bag.length) A.bag = A.keys.filter(x => x !== A.cur);
+        if (!A.bag.length) A.bag = A.keys.slice();
+        k = A.bag.splice(Math.floor(Math.random()*A.bag.length), 1)[0];
+        src = await idb(m, 'readonly', st => st.get(k)).catch(() => null);
+        if (!src){ A.keys = A.keys.filter(x => x !== k); saveAlbum(); continue; }
+      } else if (mem[m].length){
+        src = mem[m][Math.floor(Math.random()*mem[m].length)];
+      } else break;
+      const url = URL.createObjectURL(src);
+      try { const im = await loadImg(url); if (k !== null){ A.cur = k; saveAlbum(); } await newPicture(im, prefs.level); return true; }
+      catch(e){ if (k !== null){ A.keys = A.keys.filter(x => x !== k); saveAlbum(); } }
+      finally { URL.revokeObjectURL(url); }
+    }
+    syncAlbum();
+    if (quiet !== true) toast(`「폴더 고르기」로 ${m === 'book' ? '그림책으로 쓸 그림' : '사진'} 폴더를 골라 주세요.`);
+    return false;
   }
 
   // ---------- 소리·알림 ----------
@@ -598,13 +673,25 @@
     try { await newPicture(await loadImg(url), prefs.level); } catch(err){ toast('이 파일은 열 수 없어요. 사진(JPG·PNG) 파일을 골라 주세요.'); }
     URL.revokeObjectURL(url);
   });
+  $('#dir').addEventListener('change', e => {
+    const fs = e.target.files ? [...e.target.files] : [];
+    e.target.value = '';
+    if (fs.length) useAlbum(fs);
+  });
+  // 아이폰·아이패드는 폴더를 못 고르니 같은 버튼이 여러 장 고르기
+  const iOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!('webkitdirectory' in $('#dir')) || iOS){
+    const d = $('#dir'); d.removeAttribute('webkitdirectory'); d.accept = 'image/*';
+    $('#dirLbl').textContent = '여러 장 고르기';
+  }
   $('#next').addEventListener('click', nextPhoto);
   function syncMode(){ for (const b of $('#mode').querySelectorAll('[data-v]')) toggle(b, b.dataset.v === prefs.mode); }
   $('#mode').addEventListener('click', async e => {
     const b = e.target.closest('[data-v]');
     if (!b || b.dataset.v === prefs.mode) return;
-    prefs.mode = b.dataset.v; savePrefs(); syncMode(); syncUI();
-    await nextPhoto();
+    prefs.mode = b.dataset.v; savePrefs(); syncMode(); syncAlbum(); syncUI();
+    // 그 방식 폴더가 있으면 거기서, 없으면 지금 그림을 그 방식으로 다시 만든다
+    if (!(await nextPhoto(true)) && P) await newPicture(await loadImg(P.dataURL), prefs.level);
   });
   $('#level').addEventListener('click', e => {
     const b = e.target.closest('[data-v]');
@@ -644,11 +731,12 @@
   // ---------- 시작 ----------
   async function boot(){
     buildSwatches(); toggle($('#sound'), prefs.sound); syncMode();
+    loadAlbum(); syncAlbum();
     layout();
     let st = null;
     try { st = JSON.parse(store.get(KEY) || 'null'); } catch(e){}
     if (st && st.v === 1 && st.img && LEVELS[st.level]){ await newPicture(null, st.level, st); return; }
-    // 처음이면 다른 게임에 넣어 둔 내 사진으로, 없으면 기본 그림으로
+    // 처음이면 이 앱 폴더에서, 없으면 기본 그림으로
     if (!(await nextPhoto(true).catch(() => false))) await newPicture(sampleImage(), prefs.level);
   }
   new ResizeObserver(layout).observe(stage);
